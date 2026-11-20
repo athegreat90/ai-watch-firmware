@@ -1,0 +1,56 @@
+name: Daily Arduino remediation
+on:
+  schedule:
+    - cron: '52 4 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency: daily-arduino
+jobs:
+  remediate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: arduino/setup-arduino-cli@b3cda96fddef6af6c56b4c5efb5c47e2357935db
+      - id: scan
+        run: python3 security/firmware_inventory.py
+      - if: steps.scan.outputs.advisories != ''
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+        id: app
+        with:
+          app-id: ${{ vars.SECURITY_APP_ID }}
+          private-key: ${{ secrets.SECURITY_APP_PRIVATE_KEY }}
+      - if: steps.scan.outputs.advisories != ''
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          FINDINGS: ${{ steps.scan.outputs.advisories }}
+        run: |
+          title='Arduino-ESP32 advisory findings'
+          issue=$(gh issue list --state open --search '"Arduino-ESP32 advisory findings" in:title' --json number,title --jq '.[] | select(.title=="Arduino-ESP32 advisory findings") | .number' | head -1)
+          if [ -n "$issue" ]; then gh issue edit "$issue" --body "$FINDINGS"
+          else gh issue create --title "$title" --body "$FINDINGS"; fi
+      - if: steps.scan.outputs.candidate != ''
+        env:
+          VERSION: ${{ steps.scan.outputs.candidate }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          sed -i -E "s/(esp32:esp32@)[0-9.]+/\1$VERSION/" scripts/setup-arduino.ps1
+          pwsh -File scripts/setup-arduino.ps1
+          pwsh -File scripts/build-firmware.ps1
+          python3 security/firmware_inventory.py --require-clear
+          branch=security/arduino-core
+          gh auth setup-git
+          git config user.name 'AI Watch security bot'
+          git config user.email 'ai-watch-security@users.noreply.github.com'
+          git fetch origin "refs/heads/$branch:refs/remotes/origin/$branch" || true
+          git switch -c "$branch"
+          git add scripts/setup-arduino.ps1
+          git commit -m "Update Arduino-ESP32 to $VERSION"
+          git push --force-with-lease origin "$branch"
+          if ! gh pr view "$branch" --json state --jq .state | grep -q '^OPEN$'; then
+            gh pr create --base main --head "$branch" --title 'Update vulnerable Arduino-ESP32 core' --body "Built and rescanned Arduino-ESP32 $VERSION."
+          fi
