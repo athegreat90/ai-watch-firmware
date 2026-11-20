@@ -2,14 +2,21 @@
 import json
 import os
 import re
+import subprocess
 import urllib.request
 from pathlib import Path
 
 setup = Path("scripts/setup-arduino.ps1").read_text()
 version = setup.split("esp32:esp32@", 1)[1].split()[0]
-url = "https://api.github.com/repos/espressif/arduino-esp32/commits/" + version
-with urllib.request.urlopen(url, timeout=20) as response:
-    commit = json.load(response)["sha"]
+tag = f"refs/tags/{version}"
+refs = subprocess.check_output(
+    ["git", "ls-remote", "https://github.com/espressif/arduino-esp32.git", tag, tag + "^{}"],
+    text=True, timeout=30,
+)
+commits = {ref: sha for sha, ref in (line.split() for line in refs.splitlines())}
+commit = commits.get(tag + "^{}") or commits.get(tag)
+if not commit:
+    raise SystemExit(f"Unable to resolve Arduino-ESP32 tag {version}")
 request = urllib.request.Request("https://api.osv.dev/v1/query",
     data=json.dumps({"commit": commit}).encode(), headers={"Content-Type": "application/json"})
 with urllib.request.urlopen(request, timeout=20) as response:
