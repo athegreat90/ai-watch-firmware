@@ -6,6 +6,6 @@ Copy firmware/AIWatch/config.example.h to config.h alongside the sketch. Set the
 
 ## Security
 
-CI builds firmware and checks Arduino-ESP32 against OSV by Git commit. Review the printed inventory for vendored libraries without reliable advisory mapping. Apply firmware dependency changes through reviewed pull requests.
+CI builds firmware and checks Arduino-ESP32 against OSV by Git commit. Review the printed inventory for vendored libraries without reliable advisory mapping. Daily remediation opens a tracking issue for indexed Arduino-ESP32 advisories. It proposes a same-major upstream SemVer fix when the patched core compiles and clears the scan. Set SECURITY_APP_ID and SECURITY_APP_PRIVATE_KEY as described in the server repository. Review unindexed dependencies manually.
 
 Related repositories: [server](https://github.com/athegreat90/ai-watch-server) [hooks](https://github.com/athegreat90/ai-watch-hooks)
