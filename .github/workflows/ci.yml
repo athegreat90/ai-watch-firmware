@@ -21,3 +21,19 @@ jobs:
         run: ./scripts/build-firmware.ps1
       - run: g++ -std=c++17 -fsyntax-only tests/focus_timer.cpp
       - run: python3 security/firmware_inventory.py
+
+  release-eligibility:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: changes
+        env:
+          BEFORE_SHA: ${ github.event.before }
+        run: python3 release/automatic.py eligibility
+      - name: Mark qualifying changes
+        if: steps.changes.outputs.qualifies == 'true'
+        run: echo "Shipped files changed in this push."
