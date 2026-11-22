@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [1.1.1]
+
+- Accept an `https://` `BRIDGE_URL`: the server certificate is verified against the embedded ISRG Root X1 (`RootCA.h`), the clock is synced over NTP, and HTTPS requests wait up to 4 s. Plain `http` URLs behave as before.
+
 ## [1.1.0]
 
 - Full-screen blinking "NEEDS YOU" alert with project and wait time, repeated every 2 minutes until acknowledged.
