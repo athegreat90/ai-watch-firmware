@@ -30,11 +30,17 @@
 #define AIWATCH_OFFLINE_PREVIEW
 #endif
 #include "FocusTimer.h"
+#include "AlertTimer.h"
 
 #ifndef POLL_INTERVAL_MS
 #define POLL_INTERVAL_MS 3000
 #endif
+#ifndef IDLE_MS
+#define IDLE_MS (15UL * 60UL * 1000UL)  // idle character after 15 quiet minutes
+#endif
 static constexpr uint8_t MAX_SESSIONS = 8;
+static constexpr uint32_t CELEBRATE_MS = 4000;
+static constexpr uint8_t MEETING_BRIGHTNESS = 40;
 
 static const uint16_t BG        = 0x0803; // dark almost black/navy
 static const uint16_t CARD      = 0x10C7;
@@ -63,10 +69,23 @@ struct Session {
   char id[81], agent[25], project[41], status[21], detail[67];
   unsigned long duration;
   double updated;
+  bool finishedLong;
+  unsigned long waiting;
+};
+
+struct Window {
+  float used;
+  uint32_t resetsIn;
+};
+
+struct Limit {
+  bool valid;
+  Window five, week;
 };
 
 struct Snapshot {
   Session sessions[MAX_SESSIONS];
+  Limit claude, codex, antigravity;
   uint8_t count;
   unsigned total;
   int code;
@@ -79,7 +98,8 @@ static Snapshot shown{};
 static FocusTimer focus;
 static bool touchAvailable, touchPressed;
 static uint8_t brightness = 165;
-enum class Screen { Home, Sessions, Detail, Focus };
+enum class Screen { Home, Sessions, Detail, Focus, Limits };
+enum class Overlay { None, Alert, Celebrate, Idle };
 static Screen screen = Screen::Home;
 static int selected = 0, page = 0;
 struct Acknowledgement {
@@ -89,6 +109,13 @@ struct Acknowledgement {
 static Acknowledgement acknowledged[MAX_SESSIONS]{};
 static uint8_t nextAcknowledgement;
 static bool repaint = true;
+static AlertTimer alert;
+static bool meetingManual;
+static uint32_t lastActivity, celebrateUntil;
+static char celebrateText[40];
+static Overlay overlay = Overlay::None;
+static uint32_t overlayPhase;
+static uint8_t appliedBrightness = 165;
 
 void drawDuration(const Session &session);
 int fetch(Snapshot &next);
@@ -147,7 +174,127 @@ void drawDuration(const Session &session) {
         String(session.duration % 60) + "s", MUTED, 2);
 }
 
+bool meeting() { return meetingManual || focus.active(); }
+
+bool isAcknowledged(const Session &s) {
+  for (const auto &entry : acknowledged) {
+    if (!strcmp(entry.id, s.id) && !strcmp(entry.agent, s.agent) &&
+        entry.updated == s.updated) return true;
+  }
+  return false;
+}
+
+const Session *pendingAttention() {
+  if (shown.code != 200) return nullptr;
+  for (int i = 0; i < shown.count; ++i) {
+    if (!strcmp(shown.sessions[i].status, "needs_attention") &&
+        !isAcknowledged(shown.sessions[i])) return &shown.sessions[i];
+  }
+  return nullptr;
+}
+
+void drawRobot(int16_t cx, int16_t cy, uint16_t eye, bool blink) {
+  gfx->drawLine(cx, cy - 46, cx, cy - 66, WHITE_TXT);
+  gfx->fillCircle(cx, cy - 70, 6, AMBER);
+  gfx->fillRoundRect(cx - 60, cy - 46, 120, 92, 20, WHITE_TXT);
+  gfx->fillRoundRect(cx - 46, cy - 32, 92, 60, 14, BG);
+  if (blink) {
+    gfx->fillRect(cx - 28, cy - 4, 20, 4, eye);
+    gfx->fillRect(cx + 8, cy - 4, 20, 4, eye);
+  } else {
+    gfx->fillCircle(cx - 18, cy - 2, 10, eye);
+    gfx->fillCircle(cx + 18, cy - 2, 10, eye);
+  }
+  gfx->fillRoundRect(cx - 34, cy + 52, 68, 36, 10, WHITE_TXT);
+}
+
+void drawOverlay(uint32_t now) {
+  gfx->fillScreen(BG);
+  if (overlay == Overlay::Alert) {
+    const Session *s = pendingAttention();
+    const uint16_t edge = (now / 500) & 1 ? AMBER : BG;  // blinking border
+    if (edge != BG) {  // filled shapes only: the CO5300 drops the pixel writes drawRoundRect uses
+      gfx->fillRoundRect(8, 8, LCD_WIDTH - 16, LCD_HEIGHT - 16, 24, edge);
+      gfx->fillRoundRect(14, 14, LCD_WIDTH - 28, LCD_HEIGHT - 28, 20, BG);
+    }
+    label(76, 70, "NEEDS YOU", AMBER, 4);
+    if (s) {
+      label(20, 150, clipped(s->project, 20), WHITE_TXT, 3);
+      label(20, 200, s->agent, BLUE, 2);
+      label(20, 235, clipped(s->detail, 28), MUTED, 2);
+      label(20, 285, s->waiting < 60 ? "Waiting " + String(s->waiting) + "s" : "Waiting " + String(s->waiting / 60) + "m", MUTED, 2);
+    }
+    label(60, 380, "Tap to dismiss", MUTED, 2);
+  } else if (overlay == Overlay::Celebrate) {
+    static const uint16_t colors[4] = {GREEN, AMBER, BLUE, WHITE_TXT};
+    uint32_t seed = now / 250;
+    for (int i = 0; i < 30; ++i) {
+      seed = seed * 1664525u + 1013904223u;
+      const int16_t x = (seed >> 8) % LCD_WIDTH;
+      seed = seed * 1664525u + 1013904223u;
+      const int16_t y = (seed >> 8) % LCD_HEIGHT;
+      gfx->fillRect(x, y, 8, 8, colors[i % 4]);
+    }
+    drawRobot(LCD_WIDTH / 2, 170, GREEN, false);
+    label(64, 300, "Task done!", GREEN, 4);
+    label(20, 350, celebrateText, WHITE_TXT, 2);
+  } else if (overlay == Overlay::Idle) {
+    // Moves between four spots every 30 s to avoid AMOLED burn-in.
+    const uint32_t slot = (now / 30000) % 4;
+    drawRobot((slot & 1) ? 220 : 150, (slot & 2) ? 250 : 190, BLUE, (now / 600) % 6 == 0);
+  }
+}
+
+String resetText(uint32_t secs) {
+  if (secs >= 86400) return "in " + String(secs / 86400) + "d" + String((secs % 86400) / 3600) + "h";
+  if (secs >= 3600) return "in " + String(secs / 3600) + "h" + String((secs % 3600) / 60);
+  return "in " + String(secs / 60) + "m";
+}
+
+// Rounded-rect bars, not circles: the CO5300 mangles the per-line writes of fillCircle/fillArc.
+void drawLimitBar(int16_t y, const char *tag, const Window &window) {
+  const float used = constrain(window.used, 0.0f, 100.0f);
+  const uint16_t color = used >= 90 ? 0xF9C7 : (used >= 70 ? AMBER : BLUE);
+  label(20, y, String(tag) + " " + String((int)(used + 0.5f)) + "%  " + resetText(window.resetsIn), WHITE_TXT, 2);
+  gfx->fillRoundRect(20, y + 20, 328, 12, 5, CARD);
+  int16_t fill = (int16_t)(328 * used / 100);
+  if (used > 0.5f) gfx->fillRoundRect(20, y + 20, fill < 10 ? 10 : fill, 12, 5, color);
+}
+
+void drawLimitRow(int16_t y, const char *name, const Limit &limit) {
+  label(20, y, name, BLUE, 2);
+  drawLimitBar(y + 20, "5h", limit.five);
+  drawLimitBar(y + 56, "7d", limit.week);
+}
+
+void drawLimits() {
+  gfx->fillRect(0, 100, LCD_WIDTH, 286, BG);
+  struct Row { const char *name; const Limit *limit; };
+  const Row rows[3] = {{"Claude Code", &shown.claude}, {"Codex", &shown.codex}, {"Antigravity", &shown.antigravity}};
+  int16_t y = 104;
+  bool any = false;
+  for (const Row &row : rows) {
+    if (shown.code != 200 || !row.limit->valid) continue;
+    drawLimitRow(y, row.name, *row.limit);
+    y += 94;
+    any = true;
+  }
+  if (!any) label(30, 142, "No limit data yet", MUTED, 2);
+}
+
 void drawScreen(uint32_t now) {
+  static Overlay previousOverlay = Overlay::None;
+  static Screen previousScreen = Screen::Home;
+  // Overlays and the Limits screen paint outside the bands the normal screens clear.
+  if ((previousOverlay != Overlay::None && overlay == Overlay::None) ||
+      (previousScreen == Screen::Limits && screen != Screen::Limits)) gfx->fillScreen(BG);
+  previousOverlay = overlay;
+  previousScreen = screen;
+  if (overlay != Overlay::None) {
+    drawOverlay(now);
+    return;
+  }
+  if (screen == Screen::Limits) gfx->fillRect(0, 299, LCD_WIDTH, 73, BG);
   gfx->fillRect(0, 0, LCD_WIDTH, 299, BG);
   gfx->fillRect(0, 372, LCD_WIDTH, LCD_HEIGHT - 372, BG);
   label(18, 17, "AI Watch", WHITE_TXT, 4);
@@ -157,17 +304,19 @@ void drawScreen(uint32_t now) {
         (shown.code == 401 ? "Backend: check token" : "Backend offline"),
         shown.code == 200 ? GREEN : AMBER, 2);
 
+  if (meeting()) label(250, 58, "Meeting", pendingAttention() ? AMBER : MUTED, 2);
+
+  if (screen == Screen::Limits) {
+    drawLimits();
+    button(15, 389, 105, "Home");
+  }
   if (screen == Screen::Home || screen == Screen::Detail) {
     gfx->fillRoundRect(16, 111, 336, 179, 14, CARD);
     if (!shown.count || shown.code != 200) {
       label(30, 142, shown.code == 200 ? "No sessions" : "Disconnected", MUTED, 3);
     } else {
       const Session &s = shown.sessions[screen == Screen::Home ? 0 : selected];
-      bool seen = false;
-      for (const auto &entry : acknowledged) {
-        if (!strcmp(entry.id, s.id) && !strcmp(entry.agent, s.agent) &&
-            entry.updated == s.updated) seen = true;
-      }
+      const bool seen = isAcknowledged(s);
       label(30, 131, stateLabel(s.status), stateColor(s.status), 3);
       label(30, 181, clipped(s.project, 25), WHITE_TXT, 2);
       label(30, 207, s.agent, BLUE, 2);
@@ -196,18 +345,27 @@ void drawScreen(uint32_t now) {
   } else if (screen == Screen::Home) {
     button(15, 389, 112, "Sessions");
     button(135, 389, 100, "Focus");
-    button(245, 389, 108, "Refresh");
+    button(245, 389, 108, "Limits");
   } else if (screen == Screen::Detail) {
     button(15, 389, 112, "Back");
     button(135, 389, 218, "Acknowledge");
-  } else {
+  } else if (screen == Screen::Focus) {
     label(20, 128, "25-minute focus timer", WHITE_TXT, 2);
+    button(16, 160, 336, String("Meeting: ") + (meeting() ? "on" : "off"));
     button(15, 389, 105, "Home");
     button(130, 389, 105, focus.active() ? "Pause" : (focus.seconds(now) < 1500 && focus.seconds(now) ? "Resume" : "Start"));
     button(245, 389, 108, "Reset");
   }
   if (screen == Screen::Home || screen == Screen::Focus) drawTimer(now);
   else if (screen == Screen::Detail) gfx->fillRect(0, 299, LCD_WIDTH, 73, BG);
+}
+
+static void parseLimit(JsonObjectConst row, Limit &out) {
+  JsonObjectConst five = row["five_hour"], week = row["weekly"];
+  if (five.isNull() || week.isNull()) return;
+  out.five = {five["used_pct"] | 0.0f, five["resets_in"] | 0U};
+  out.week = {week["used_pct"] | 0.0f, week["resets_in"] | 0U};
+  out.valid = true;
 }
 
 int fetch(Snapshot &next) {
@@ -220,7 +378,7 @@ int fetch(Snapshot &next) {
   if (code == 200) {
     JsonDocument doc;
     int length = http.getSize();
-    if (length < 1 || length > 8192 ||
+    if (length < 1 || length > 12288 ||
         deserializeJson(doc, http.getStream(), DeserializationOption::NestingLimit(6))) {
       code = -2;
     } else {
@@ -242,12 +400,17 @@ int fetch(Snapshot &next) {
         strlcpy(s.detail, row["detail"] | "", sizeof(s.detail));
         s.duration = row["duration"] | 0UL;
         s.updated = row["updated"] | 0.0;
+        s.finishedLong = row["finished_long"] | false;
+        s.waiting = row["waiting"] | 0UL;
       }
+      parseLimit(doc["limits"]["Claude Code"], next.claude);
+      parseLimit(doc["limits"]["Codex"], next.codex);
+      parseLimit(doc["limits"]["Antigravity"], next.antigravity);
       next.total = doc["total_count"] | next.count;
     }
   }
   http.end();
-  if (code != 200) next.count = next.total = 0;
+  if (code != 200) { next.count = next.total = 0; next.claude.valid = next.codex.valid = next.antigravity.valid = false; }
   return code;
 }
 
@@ -287,9 +450,16 @@ void pollTouch(uint32_t now) {
   int x = touch->IIC_Read_Device_Value(TouchValue::TOUCH_COORDINATE_X);
   int y = touch->IIC_Read_Device_Value(TouchValue::TOUCH_COORDINATE_Y);
   if (x < 0 || x >= LCD_WIDTH || y < 0 || y >= LCD_HEIGHT) return;
+  lastActivity = now;
+  if (overlay != Overlay::None) {  // first touch only wakes/dismisses; it never presses a hidden button
+    if (overlay == Overlay::Alert) alert.dismiss();
+    else if (overlay == Overlay::Celebrate) celebrateUntil = 0;
+    Serial.printf("[%lu] Overlay dismissed by touch\n", now);
+    repaint = true;
+    return;
+  }
   if (screen == Screen::Home && y >= 12 && y < 58 && x >= 248) {
-    brightness = brightness >= 215 ? 65 : brightness + 50;
-    gfx->setBrightness(brightness);
+    brightness = brightness >= 215 ? 65 : brightness + 50;  // applied by loop()
     return;
   }
   if (screen == Screen::Sessions && y >= 146 && y < 338) {
@@ -298,12 +468,14 @@ void pollTouch(uint32_t now) {
       selected = row;
       screen = Screen::Detail;
     }
+  } else if (screen == Screen::Focus && y >= 160 && y < 206) {
+    meetingManual = !meetingManual;
   } else if (y >= 389 && y < 435) {
     switch (screen) {
       case Screen::Home:
         if (x < 130) { screen = Screen::Sessions; page = 0; }
         else if (x < 240) screen = Screen::Focus;
-        else if (networkWorker) xTaskNotifyGive(networkWorker);
+        else screen = Screen::Limits;
         break;
       case Screen::Sessions:
         if (x < 125) screen = Screen::Home;
@@ -326,6 +498,9 @@ void pollTouch(uint32_t now) {
         else if (x < 240) focus.toggle(now);
         else focus.reset();
         break;
+      case Screen::Limits:
+        if (x < 125) screen = Screen::Home;
+        break;
     }
   }
   repaint = true;
@@ -334,7 +509,7 @@ void pollTouch(uint32_t now) {
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("AI Watch 1.0.0 | Waveshare 1.8 V2");
+  Serial.println("AI Watch 1.1.0 | Waveshare 1.8 V2");
 
   Wire.begin(IIC_SDA, IIC_SCL);
   Wire.setTimeOut(25);
@@ -372,6 +547,7 @@ void setup() {
   Serial.println("CO5300 display initialized");
   gfx->setBrightness(165); // lower than maximum to reduce AMOLED wear
   gfx->setTextWrap(false);
+  lastActivity = millis();
 #ifdef AIWATCH_OFFLINE_PREVIEW
   Serial.println("Offline preview: create config.h to enable Wi-Fi");
 #else
@@ -382,11 +558,17 @@ void setup() {
 #endif
 }
 
+static bool limitChanged(const Limit &a, const Limit &b) {
+  return a.valid != b.valid || (a.valid && (fabsf(a.five.used - b.five.used) >= 0.5f ||
+         fabsf(a.week.used - b.week.used) >= 0.5f || a.five.resetsIn / 60 != b.five.resetsIn / 60 ||
+         a.week.resetsIn / 60 != b.week.resetsIn / 60));
+}
+
 void loop() {
   uint32_t now = millis();
   const bool wasRunning = focus.active();
   focus.tick(now);
-  if (screen == Screen::Focus && wasRunning != focus.active()) repaint = true;
+  if (wasRunning != focus.active()) repaint = true;  // meeting badge/brightness follow the timer
   pollTouch(now);
   Snapshot next{};
   if (inbox && xQueueReceive(inbox, &next, 0) == pdTRUE) {
@@ -398,6 +580,28 @@ void loop() {
       changed = before.updated != after.updated || strcmp(before.id, after.id) ||
                 strcmp(before.agent, after.agent);
     }
+    const bool sessionsChanged = changed;  // limit countdowns must not count as user activity
+    if (limitChanged(shown.claude, next.claude) || limitChanged(shown.codex, next.codex) ||
+        limitChanged(shown.antigravity, next.antigravity)) {
+      if (screen == Screen::Limits) changed = true;
+      Serial.printf("[%lu] Limits: claude=%d codex=%d antigravity=%d\n", now, next.claude.valid, next.codex.valid,
+                    next.antigravity.valid);
+    }
+    for (int i = 0; i < next.count; ++i) {
+      const Session &after = next.sessions[i];
+      for (int j = 0; j < shown.count; ++j) {
+        const Session &before = shown.sessions[j];
+        if (strcmp(before.id, after.id) || strcmp(before.agent, after.agent)) continue;
+        if (!strcmp(before.status, "working") && !strcmp(after.status, "done") &&
+            after.finishedLong && !meeting()) {
+          celebrateUntil = now + CELEBRATE_MS;
+          snprintf(celebrateText, sizeof(celebrateText), "%.18s  %lum", after.project, after.duration / 60);
+          Serial.printf("[%lu] Celebrate: %s %lum\n", now, after.project, after.duration / 60);
+        }
+        break;
+      }
+    }
+    if (sessionsChanged) lastActivity = now;
     if (changed && screen == Screen::Detail && selected < shown.count) {
       const Session &old = shown.sessions[selected];
       int match = 0;
@@ -407,7 +611,7 @@ void loop() {
       else selected = match;
     }
     const int visible = screen == Screen::Home ? 0 : selected;
-    if (!changed && next.code == 200 &&
+    if (!changed && next.code == 200 && overlay == Overlay::None &&
         (screen == Screen::Home || screen == Screen::Detail) &&
         visible < next.count && shown.sessions[visible].duration != next.sessions[visible].duration) {
       drawDuration(next.sessions[visible]);
@@ -416,12 +620,46 @@ void loop() {
     if (page >= shown.count) page = 0;
     repaint = repaint || changed;
   }
+  const Session *pending = pendingAttention();
+  if (alert.poll(pending && !meeting(), now)) {
+    lastActivity = now;
+    Serial.printf("[%lu] Alert: show %s / %s\n", now, pending->agent, pending->project);
+  }
+  Overlay want = Overlay::None;
+  if (celebrateUntil && (int32_t)(celebrateUntil - now) > 0) want = Overlay::Celebrate;
+  else if (alert.visible() && !meeting()) want = Overlay::Alert;
+  else if (now - lastActivity >= IDLE_MS && !pending) want = Overlay::Idle;
+  if (celebrateUntil && want != Overlay::Celebrate) celebrateUntil = 0;
+  const uint32_t phase = want == Overlay::Alert ? now / 500 : want == Overlay::Celebrate ? now / 250 :
+                         want == Overlay::Idle ? now / 600 : 0;
+  if (want != overlay || phase != overlayPhase) {
+    if (want != overlay) Serial.printf("[%lu] Overlay: %d -> %d (1=alert 2=celebrate 3=idle)\n", now, (int)overlay, (int)want);
+    overlay = want;
+    overlayPhase = phase;
+    repaint = true;
+  }
+  static bool wasMeeting = false;
+  if (meeting() != wasMeeting) {
+    wasMeeting = meeting();
+    Serial.printf("[%lu] Meeting: %s\n", now, wasMeeting ? "on" : "off");
+  }
+  const uint8_t level = wasMeeting ? MEETING_BRIGHTNESS : brightness;
+  if (level != appliedBrightness) {
+    gfx->setBrightness(level);
+    appliedBrightness = level;
+  }
+  static Screen loggedScreen = Screen::Home;
+  if (screen != loggedScreen) {
+    Serial.printf("[%lu] Screen: %d (0=home 1=sessions 2=detail 3=focus 4=limits)\n", now, (int)screen);
+    loggedScreen = screen;
+  }
   static uint32_t previous = UINT32_MAX;
   uint32_t seconds = focus.seconds(now);
   if (repaint) {
     drawScreen(now);
     repaint = false;
-  } else if (seconds != previous && (screen == Screen::Home || screen == Screen::Focus)) {
+  } else if (seconds != previous && overlay == Overlay::None &&
+             (screen == Screen::Home || screen == Screen::Focus)) {
     drawTimer(now);
   }
   previous = seconds;

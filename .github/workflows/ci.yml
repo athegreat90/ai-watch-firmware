@@ -19,7 +19,7 @@ jobs:
         run: ./scripts/setup-arduino.ps1
       - shell: pwsh
         run: ./scripts/build-firmware.ps1
-      - run: g++ -std=c++17 -fsyntax-only tests/focus_timer.cpp
+      - run: g++ -std=c++17 -fsyntax-only tests/focus_timer.cpp tests/alert_timer.cpp
       - run: python3 security/firmware_inventory.py
 
   release-eligibility:
