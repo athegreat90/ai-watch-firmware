@@ -17,6 +17,8 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include "RootCA.h"
 #include <ArduinoJson.h>
 #include <Arduino_GFX_Library.h>
 #include <Arduino_DriveBus_Library.h>
@@ -370,9 +372,16 @@ static void parseLimit(JsonObjectConst row, Limit &out) {
 
 int fetch(Snapshot &next) {
   HTTPClient http;
-  http.setConnectTimeout(1200);
-  http.setTimeout(1500);
-  if (!http.begin(BRIDGE_URL)) return -1;
+  WiFiClientSecure secure;
+  const bool tls = strncmp(BRIDGE_URL, "https://", 8) == 0;
+  // The TLS handshake takes longer than a LAN request; the certificate is checked against ROOT_CA.
+  http.setConnectTimeout(tls ? 4000 : 1200);
+  http.setTimeout(tls ? 4000 : 1500);
+  if (tls) {
+    if (time(nullptr) < 1700000000) return -3;  // clock not synced yet: the certificate dates cannot be checked
+    secure.setCACert(ROOT_CA);
+  }
+  if (!(tls ? http.begin(secure, BRIDGE_URL) : http.begin(BRIDGE_URL))) return -1;
   http.addHeader("X-Monitor-Key", MONITOR_TOKEN);
   int code = http.GET();
   if (code == 200) {
@@ -419,6 +428,7 @@ void monitorNetwork(void *) {
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  configTime(0, 0, "pool.ntp.org", "time.google.com");  // certificate validity needs the wall clock
   int previous = -99;
   uint32_t lastRetry = millis();
   for (;;) {
@@ -430,7 +440,7 @@ void monitorNetwork(void *) {
     }
     next.code = next.wifi ? fetch(next) : 0;
     if (next.code != previous) {
-      Serial.printf("Backend status: %d (0=Wi-Fi offline, -2=invalid JSON)\n", next.code);
+      Serial.printf("Backend status: %d (0=Wi-Fi offline, -2=invalid JSON, -3=clock not synced)\n", next.code);
       previous = next.code;
     }
     xQueueOverwrite(inbox, &next);

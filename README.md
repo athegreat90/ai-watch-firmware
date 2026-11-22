@@ -28,7 +28,7 @@ The first build runs as an offline preview. For live monitoring, copy `firmware/
 |---|---|
 | `WIFI_SSID` | Your 2.4 GHz Wi-Fi name |
 | `WIFI_PASSWORD` | Its password |
-| `BRIDGE_URL` | Full status URL of the server, for example `http://192.168.1.50:8765/api/status` |
+| `BRIDGE_URL` | Full status URL of the server, for example `http://192.168.1.50:8765/api/status`, or an `https://` URL whose certificate chains to ISRG Root X1 (Let's Encrypt; embedded in `RootCA.h`). HTTPS needs the clock, which the watch syncs over NTP after Wi-Fi connects |
 | `MONITOR_TOKEN` | The `token` from the server's `bridge/config.local.json` |
 
 Never share `config.h`. Then upload with the port that Arduino CLI listed and open the serial monitor:
@@ -65,7 +65,7 @@ The serial monitor (115200) prints timestamped markers (`Screen:`, `Alert:`, `Ce
 | Symptom | Cause and fix |
 |---|---|
 | Shows "Backend: check token" | `MONITOR_TOKEN` differs from the server's token |
-| Shows "Backend offline" | Wrong `BRIDGE_URL`, server not reachable from the Wi-Fi network, firewall, or 5 GHz-only Wi-Fi |
+| Shows "Backend offline" | Wrong `BRIDGE_URL`, an `https` server with a different root CA (update `RootCA.h`) or no NTP access (serial log shows status -3), server not reachable from the Wi-Fi network, firewall, or 5 GHz-only Wi-Fi |
 | Offline preview only | `firmware/AIWatch/config.h` is missing |
 | Upload fails or port busy | Close the serial monitor and any other program using the port, then retry with the port from `arduino-cli board list` |
 | Blank or unresponsive display | Check the serial log for display and touch initialization; run the `-Target Hello` check above |
